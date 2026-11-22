@@ -1,0 +1,2416 @@
+import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { Component, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ReactNode } from "react";
+import {
+  ArrowLeft,
+  MessagesSquare,
+  BriefcaseBusiness,
+  CircleDashed,
+  Search,
+  Bell,
+  BellOff,
+  Sun,
+  Moon,
+  Users,
+  Phone,
+  Video,
+  MessageCircleOff,
+  RefreshCw,
+  X,
+  Info,
+  Store,
+  Settings2,
+} from "lucide-react";
+import { supabase } from "@/lib/supabase";
+import { cleanNumber } from "@/lib/use-messages";
+import { checkRegistered, ensureMyProfile } from "@/lib/registration";
+import { previewLabel } from "@/lib/media-utils";
+import { useBackLayer } from "@/lib/use-back-button";
+import { KeypadField } from "@/components/app/keypad-field";
+import { SlideBanner } from "@/components/app/slide-banner";
+import { ChatScreen, type ChatContact } from "@/components/app/chat-screen";
+import { GroupChatScreen } from "@/components/app/group-chat-screen";
+import { CallScreen, IncomingCallHost, type CallKind } from "@/components/app/call-screen";
+import { BusinessTab } from "@/components/app/business-tab";
+import { SettingsTab } from "@/components/app/settings-tab";
+import { NewGroupDialog } from "@/components/app/new-group-dialog";
+import { AppIcon } from "@/components/app/app-icon";
+import { AppWallpaper as Wallpaper } from "@/components/app/wallpaper";
+import { ReelsFeed } from "@/components/app/reels-feed";
+import { useAppState } from "@/lib/app-store";
+import { makeT } from "@/lib/i18n";
+import { cn } from "@/lib/utils";
+import { PermissionGate, PERMS_KEY } from "@/components/app/permission-gate";
+import { syncPhoneContacts } from "@/lib/native-contacts";
+import { initScreenSecure } from "@/lib/screen-secure";
+import { ConnectionBanner } from "@/components/app/connection-banner";
+import { StatusPanel } from "@/components/app/status-panel";
+import { CallsTab } from "@/components/app/calls-tab";
+import { useCallGuard } from "@/components/app/call-guard";
+import { useAppBackgroundStyle } from "@/components/app/wallpaper-settings";
+import { initNativePush, syncPushToken, registerNativePush } from "@/lib/native-push";
+import { BatteryGuide, shouldShowBatteryGuide } from "@/components/app/battery-guide";
+import { startPresence } from "@/components/app/business-extras";
+import { ShareTargetHost } from "@/components/app/share-target-host";
+import { ShoppingTab } from "@/components/app/shopping-tab";
+import {
+  BusinessSetupSheet,
+  BusinessPanel,
+  OfferBannerCard,
+  loadBizSetup,
+  type BizSetup,
+} from "@/components/app/business-setup";
+import {
+  ChatNavIcon,
+  GroupNavIcon,
+  ShopNavIcon,
+  StoryNavIcon,
+  CallNavIcon,
+} from "@/components/app/nav-icons";
+
+export const Route = createFileRoute("/home")({
+  validateSearch: (search: Record<string, unknown>) => ({
+    tab: (typeof search.tab === "string" ? search.tab : "chats") as TabKey,
+    chat: typeof search.chat === "string" ? search.chat : undefined,
+  }),
+  head: () => ({
+    meta: [
+      { title: "Home — Pro Chat India" },
+      {
+        name: "description",
+        content:
+          "Your Pro Chat India dashboard: chats, groups, business, shopping, status and calls in one secure place.",
+      },
+    ],
+  }),
+  component: Home,
+  errorComponent: HomeCrash,
+});
+
+// "business" पुराने लिंक के लिए बचा है: अब वो Group टैब के Business हिस्से में खुलता है
+type TabKey = "chats" | "groups" | "shopping" | "status" | "calls" | "business" | "settings";
+type GroupSide = "groups" | "business";
+type Chip = "All" | "Today" | "Weeks" | "Month";
+type StatusSubTab = "status" | "reels";
+
+type ChatRow = {
+  name: string;
+  msg: string;
+  time: string;
+  unread: number;
+  avatar: string;
+  members?: string[];
+  phone?: string;
+  hasStatus?: boolean;
+  createdAt?: string;
+  groupId?: string;
+  memberPhones?: string[];
+};
+
+type ActiveChat = ChatContact & { groupId?: string; memberPhones?: string[] };
+
+type GroupRow = {
+  id: string;
+  name: string;
+  avatar: string;
+  createdAt: string;
+  memberPhones: string[];
+  lastText?: string;
+  lastSender?: string;
+  lastAt?: string;
+};
+
+type PhoneContact = { name: string; phone: string; avatar: string };
+
+const CONTACTS_KEY = "prochat_synced_contacts";
+const OLD_CONTACTS_KEY = "pci_phone_contacts";
+const dbx = supabase as any;
+
+/* ------------------------------------------------------------------ */
+/* छोटे हेल्पर                                                          */
+/* ------------------------------------------------------------------ */
+
+/** पहली स्क्रीन बन जाने के बाद ही चलाओ: ऐप तुरंत खुले, भारी काम बाद में */
+function runWhenIdle(fn: () => void, timeout = 1500): () => void {
+  if (typeof window === "undefined") return () => {};
+  const w = window as any;
+  if (typeof w.requestIdleCallback === "function") {
+    const id = w.requestIdleCallback(fn, { timeout });
+    return () => w.cancelIdleCallback?.(id);
+  }
+  const id = window.setTimeout(fn, 400);
+  return () => window.clearTimeout(id);
+}
+
+/** profiles टेबल के कॉलम अलग-अलग हो सकते हैं (name/full_name, avatar/avatar_url): जो चले वही इस्तेमाल करो */
+const PROFILE_COLS = ["phone, name, full_name, avatar, avatar_url", "phone, full_name, avatar_url", "phone, name, avatar"];
+async function queryProfiles(build: (cols: string) => any): Promise<any[]> {
+  for (const cols of PROFILE_COLS) {
+    try {
+      const res = await build(cols);
+      if (!res?.error) return Array.isArray(res?.data) ? res.data : [];
+    } catch {
+      /* अगला विकल्प */
+    }
+  }
+  return [];
+}
+const profName = (p: any) => String(p?.name || p?.full_name || "");
+const profAvatar = (p: any) =>
+  String((typeof p?.avatar_url === "string" && p.avatar_url.startsWith("http") ? p.avatar_url : p?.avatar) || "🙂");
+
+/** सुरक्षा-घेरा: कोई एक स्क्रीन फ़ेल हो तो पूरा ऐप सफ़ेद न हो */
+class SafeBoundary extends Component<
+  { label: string; onReset?: () => void; children: ReactNode },
+  { error: string | null }
+> {
+  state = { error: null as string | null };
+  static getDerivedStateFromError(e: unknown) {
+    return { error: e instanceof Error ? e.message : String(e) };
+  }
+  componentDidCatch(e: unknown) {
+    console.error("[home] crash in", this.props.label, e);
+  }
+  render() {
+    if (this.state.error !== null) {
+      return (
+        <div className="m-4 rounded-2xl border border-red-300 bg-red-50 p-4 text-center text-sm text-red-700 dark:bg-red-950/40 dark:text-red-200">
+          <p className="font-semibold">{this.props.label} में दिक्कत आई</p>
+          <p className="mt-1 break-words text-xs opacity-80">{this.state.error}</p>
+          <button
+            type="button"
+            onClick={() => {
+              this.setState({ error: null });
+              this.props.onReset?.();
+            }}
+            className="mt-3 rounded-xl bg-red-600 px-4 py-2 text-xs font-bold text-white active:scale-95"
+          >
+            फिर से कोशिश करें
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+/** route-स्तर की दुर्घटना: सफ़ेद पेज की जगह कारण और बटन दिखाओ */
+function HomeCrash({ error, reset }: { error: unknown; reset?: () => void }) {
+  const msg = error instanceof Error ? error.message : String(error ?? "");
+  return (
+    <div className="flex min-h-[100dvh] flex-col items-center justify-center gap-3 bg-background p-6 text-center">
+      <p className="text-4xl">⚠️</p>
+      <p className="text-base font-semibold">ऐप खुलने में दिक्कत आई</p>
+      <p className="max-w-xs break-words rounded-xl bg-secondary/60 p-3 text-xs text-muted-foreground">
+        {msg || "अज्ञात त्रुटि"}
+      </p>
+      <div className="flex gap-2">
+        <button
+          type="button"
+          onClick={() => reset?.()}
+          className="rounded-xl bg-emerald-600 px-4 py-2 text-sm font-bold text-white active:scale-95"
+        >
+          फिर से कोशिश करें
+        </button>
+        <button
+          type="button"
+          onClick={() => window.location.reload()}
+          className="rounded-xl bg-secondary px-4 py-2 text-sm font-bold active:scale-95"
+        >
+          ऐप रीलोड करें
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** सेव की हुई लिस्ट को हमेशा {name, phone, avatar} रूप में पढ़ो (नेटिव सिंक में avatar नहीं होता) */
+function normalizeContacts(parsed: unknown): PhoneContact[] {
+  if (!Array.isArray(parsed)) return [];
+  return (parsed as Record<string, unknown>[])
+    .map((c) => {
+      const phone = cleanNumber(String(c["phone"] ?? c["number"] ?? ""));
+      const name = String(c["name"] ?? "").trim();
+      const av = c["avatar"];
+      return { name: name || phone, phone, avatar: typeof av === "string" && av ? av : "🙂" };
+    })
+    .filter((c) => c.phone.length === 10);
+}
+
+function loadContacts(): PhoneContact[] {
+  try {
+    const raw = localStorage.getItem(CONTACTS_KEY) ?? localStorage.getItem(OLD_CONTACTS_KEY);
+    if (!raw) return [];
+    return normalizeContacts(JSON.parse(raw));
+  } catch {
+    return [];
+  }
+}
+
+/** सेव करते समय पुराने अतिरिक्त फ़ील्ड (जैसे onProChat) बने रहें */
+function saveContacts(contacts: PhoneContact[]) {
+  try {
+    const prev = new Map<string, Record<string, unknown>>();
+    try {
+      const old = JSON.parse(localStorage.getItem(CONTACTS_KEY) || "[]") as Record<string, unknown>[];
+      for (const c of Array.isArray(old) ? old : []) prev.set(cleanNumber(String(c["phone"] ?? "")), c);
+    } catch {
+      /* ignore */
+    }
+    localStorage.setItem(
+      CONTACTS_KEY,
+      JSON.stringify(contacts.map((c) => ({ ...(prev.get(c.phone) ?? {}), ...c }))),
+    );
+  } catch {
+    /* storage full ya blocked */
+  }
+}
+
+function readPermsDone(): boolean {
+  try {
+    return localStorage.getItem(PERMS_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+const MUTE_KEY = "pci-media-muted";
+const MUTE_EVT = "pci-mute-change";
+
+function readMuted(): boolean {
+  try {
+    const v = localStorage.getItem(MUTE_KEY);
+    return v === null ? true : v === "1";
+  } catch {
+    return true;
+  }
+}
+function writeMuted(v: boolean) {
+  try {
+    localStorage.setItem(MUTE_KEY, v ? "1" : "0");
+    window.dispatchEvent(new CustomEvent(MUTE_EVT, { detail: v }));
+  } catch {
+    /* ignore */
+  }
+}
+
+const FONT_SCALE: Record<string, string> = {
+  sm: "13px",
+  base: "15px",
+  lg: "18px",
+  xl: "21px",
+};
+
+const SURFACE_CLASSES: Record<string, string> = {
+  default: "bg-zinc-50 dark:bg-zinc-950",
+  slate: "bg-slate-100 dark:bg-slate-900",
+  cream: "bg-amber-50 dark:bg-amber-950",
+  mint: "bg-emerald-50 dark:bg-emerald-950",
+  lavender: "bg-purple-50 dark:bg-purple-950",
+  charcoal: "bg-zinc-800 dark:bg-zinc-950",
+};
+
+/** Settings का Disappearing timer -> घंटे (चैट में expires_at इसी से बनता है) */
+const DISAPPEAR_HOURS: Record<string, number> = { off: 0, "24h": 24, "48h": 48, "7d": 168 };
+
+const ts = (iso?: string) => (iso ? Date.parse(iso) || 0 : 0);
+
+function compactTime(iso?: string) {
+  if (!iso) return "";
+  const diffMs = Date.now() - ts(iso);
+  const min = Math.floor(diffMs / 60000);
+  if (min < 1) return "1S";
+  if (min < 60) return `${min}M`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}H`;
+  const day = Math.floor(hr / 24);
+  if (day < 7) return `${day}D`;
+  return `${Math.floor(day / 7)}W`;
+}
+
+/** चिप फ़िल्टर: "All" के अलावा बिना बातचीत वाले आइटम बाहर */
+function inBucket(iso: string | undefined, chip: Chip) {
+  if (chip === "All") return true;
+  if (!iso) return false;
+  const t = ts(iso);
+  if (!t) return false;
+  if (chip === "Today") return new Date(t).toDateString() === new Date().toDateString();
+  const diffDays = (Date.now() - t) / 86_400_000;
+  if (chip === "Weeks") return diffDays < 7;
+  return diffDays < 30;
+}
+
+type RingState = "none" | "new" | "seen";
+
+/** none = रिंग नहीं, new = रंगीन (हरा/ग्रेडिएंट), seen = देखा जा चुका (ग्रे) */
+function StatusRing({
+  children,
+  state = "none",
+  active,
+}: {
+  children: React.ReactNode;
+  state?: RingState;
+  active?: boolean;
+}) {
+  const st: RingState = state !== "none" ? state : active ? "new" : "none";
+  return (
+    <div
+      className={cn(
+        "flex size-13 shrink-0 items-center justify-center rounded-full p-[2.5px]",
+        st === "new"
+          ? "bg-[conic-gradient(from_0deg,#22c55e,#10b981,#06b6d4,#8b5cf6,#ec4899,#22c55e)]"
+          : st === "seen"
+            ? "bg-zinc-400/70 dark:bg-zinc-600"
+            : "bg-transparent",
+      )}
+    >
+      <div className="flex size-full items-center justify-center overflow-hidden rounded-full bg-white text-2xl dark:bg-zinc-900">
+        {children}
+      </div>
+    </div>
+  );
+}
+
+const isImgSrc = (a?: string | null) => Boolean(a && /^(https?:|data:|blob:)/.test(a));
+
+/** avatar emoji हो या फ़ोटो-URL, दोनों दिखाओ */
+function AvatarFace({ avatar, className }: { avatar?: string | null; className?: string }) {
+  if (isImgSrc(avatar)) return <img src={avatar!} alt="" className={cn("size-full object-cover", className)} />;
+  return <>{avatar || "🙂"}</>;
+}
+
+function CloudChip({
+  label,
+  active,
+  onClick,
+}: {
+  label: string;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        "relative shrink-0 rounded-2xl px-4 py-1.5 text-[11px] font-bold text-white shadow-sm transition-all active:scale-95",
+        active ? "bg-[#48cae4]" : "bg-[#48cae4]/40",
+      )}
+    >
+      <span
+        className={cn(
+          "pointer-events-none absolute -top-1.5 left-3 size-3 rounded-full",
+          active ? "bg-[#48cae4]" : "bg-[#48cae4]/40",
+        )}
+      />
+      <span
+        className={cn(
+          "pointer-events-none absolute -top-2 left-1/2 size-3.5 -translate-x-1/2 rounded-full",
+          active ? "bg-[#48cae4]" : "bg-[#48cae4]/40",
+        )}
+      />
+      <span
+        className={cn(
+          "pointer-events-none absolute -top-1.5 right-3 size-3 rounded-full",
+          active ? "bg-[#48cae4]" : "bg-[#48cae4]/40",
+        )}
+      />
+      <span className="relative z-10">{label}</span>
+    </button>
+  );
+}
+
+/** नीचे से स्मूथ स्लाइड होकर खुलने वाला पूरा पेज: Settings / "You" और "My Business" दोनों इसी से */
+function SettingsSheet({
+  open,
+  onClose,
+  children,
+  title = "Settings",
+  headerClass = "bg-emerald-500",
+  compact = false,
+}: {
+  open: boolean;
+  onClose: () => void;
+  children: React.ReactNode;
+  title?: string;
+  headerClass?: string;
+  compact?: boolean;
+}) {
+  const [mounted, setMounted] = useState(false);
+  const [shown, setShown] = useState(false);
+
+  useEffect(() => {
+    if (open) {
+      setMounted(true);
+      const id = requestAnimationFrame(() => requestAnimationFrame(() => setShown(true)));
+      return () => cancelAnimationFrame(id);
+    }
+    setShown(false);
+    const tm = setTimeout(() => setMounted(false), 320);
+    return () => clearTimeout(tm);
+  }, [open]);
+
+  if (!mounted) return null;
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={title}
+      className={cn(
+        "fixed inset-0 z-[45] mx-auto flex w-full max-w-md flex-col bg-background transition-transform duration-300 ease-out lg:max-w-none",
+        shown ? "translate-y-0" : "translate-y-full",
+      )}
+    >
+      <header
+        className={cn(
+          "flex shrink-0 items-center gap-3 px-3 text-white shadow-md",
+          compact ? "pt-3 pb-2" : "pt-6 pb-3",
+          headerClass,
+        )}
+      >
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Back"
+          className="flex size-10 items-center justify-center rounded-full bg-white/15 transition-all active:scale-90 rtl:rotate-180"
+        >
+          <ArrowLeft className="size-5" />
+        </button>
+        <h2 className={cn("font-display font-bold", compact ? "text-base" : "text-lg")}>{title}</h2>
+      </header>
+      <div className="min-h-0 flex-1 overflow-y-auto pb-6">{children}</div>
+    </div>
+  );
+}
+
+const SEEN_KEY = "pci_status_seen";
+const DAY_MS = 86_400_000;
+
+/** पिछले 24 घंटे में जिन नंबरों ने Status डाला (Supabase `statuses`): नंबर -> सबसे नए status का समय */
+function useActiveStatuses() {
+  const [map, setMap] = useState<Map<string, number>>(() => new Map());
+  useEffect(() => {
+    let dead = false;
+    const load = async () => {
+      try {
+        const since = new Date(Date.now() - DAY_MS).toISOString();
+        let res: any = await dbx.from("statuses").select("*").gte("created_at", since).limit(500);
+        if (res?.error) res = await dbx.from("statuses").select("*").limit(300);
+        if (dead || res?.error) return;
+        const nowMs = Date.now();
+        const next = new Map<string, number>();
+        for (const r of (res?.data ?? []) as any[]) {
+          const phone = cleanNumber(String(r?.owner_phone ?? r?.phone ?? r?.user_phone ?? r?.owner ?? ""));
+          const created = Date.parse(String(r?.created_at ?? "")) || 0;
+          const exp = r?.expires_at ? Date.parse(String(r.expires_at)) || 0 : 0;
+          if (phone.length !== 10 || !created) continue;
+          if (nowMs - created > DAY_MS) continue;
+          if (exp && exp < nowMs) continue;
+          next.set(phone, Math.max(next.get(phone) ?? 0, created));
+        }
+        setMap(next);
+      } catch (e) {
+        console.warn("status ring load failed:", e);
+      }
+    };
+
+    let iv: number | undefined;
+    let ch: ReturnType<typeof supabase.channel> | null = null;
+    // रिंग पहले सेकंड में ज़रूरी नहीं: पहली स्क्रीन बनने के बाद शुरू
+    const boot = window.setTimeout(() => {
+      void load();
+      iv = window.setInterval(load, 60_000);
+      try {
+        ch = supabase
+          .channel(`home-status-${Math.random().toString(36).slice(2, 8)}`)
+          .on("postgres_changes", { event: "INSERT", schema: "public", table: "statuses" }, () => void load())
+          .subscribe();
+      } catch {
+        /* ignore */
+      }
+    }, 1800);
+
+    return () => {
+      dead = true;
+      window.clearTimeout(boot);
+      if (iv !== undefined) window.clearInterval(iv);
+      if (ch) {
+        try {
+          supabase.removeChannel(ch);
+        } catch {
+          /* ignore */
+        }
+      }
+    };
+  }, []);
+  return map;
+}
+
+/** किस नंबर का status कब तक देखा जा चुका है (localStorage) */
+function useSeenStatuses() {
+  const read = (): Record<string, number> => {
+    try {
+      const v = JSON.parse(localStorage.getItem(SEEN_KEY) || "{}");
+      return v && typeof v === "object" ? (v as Record<string, number>) : {};
+    } catch {
+      return {};
+    }
+  };
+  const [seen, setSeen] = useState<Record<string, number>>(read);
+  const markSeen = useCallback((phone: string, upTo?: number) => {
+    const p = cleanNumber(phone);
+    if (!p) return;
+    setSeen((cur) => {
+      const next = { ...cur, [p]: Math.max(cur[p] ?? 0, upTo ?? Date.now()) };
+      try {
+        localStorage.setItem(SEEN_KEY, JSON.stringify(next));
+      } catch {
+        /* ignore */
+      }
+      return next;
+    });
+  }, []);
+  // स्टेटस देखने पर window.dispatchEvent(new CustomEvent("pci-status-viewed", { detail: { phone } })) भेजा जाता है: रिंग ग्रे हो जाती है
+  useEffect(() => {
+    const onViewed = (e: Event) => {
+      const phone = (e as CustomEvent<{ phone?: string }>).detail?.phone;
+      if (phone) markSeen(phone);
+    };
+    window.addEventListener("pci-status-viewed", onViewed);
+    return () => window.removeEventListener("pci-status-viewed", onViewed);
+  }, [markSeen]);
+  return { seen, markSeen };
+}
+
+/** किन नंबरों की Business प्रोफ़ाइल बनी है (Supabase `business_profiles`): इन्हीं से हुई चैट "Business" में दिखती हैं */
+function useBusinessPhones() {
+  const [phones, setPhones] = useState<Set<string>>(() => new Set());
+  useEffect(() => {
+    let dead = false;
+    const stop = runWhenIdle(() => {
+      void (async () => {
+        try {
+          const res: any = await dbx.from("business_profiles").select("*").limit(500);
+          if (dead || res?.error) return;
+          const next = new Set<string>();
+          for (const r of (res?.data ?? []) as any[]) {
+            const p = cleanNumber(String(r?.owner_phone ?? r?.phone ?? r?.user_phone ?? r?.owner ?? ""));
+            if (p.length === 10) next.add(p);
+          }
+          setPhones(next);
+        } catch (e) {
+          console.warn("business phones load failed:", e);
+        }
+      })();
+    }, 2500);
+    return () => {
+      dead = true;
+      stop();
+    };
+  }, []);
+  return phones;
+}
+
+/** WhatsApp जैसा प्रोफ़ाइल कार्ड: बड़ी फ़ोटो, नाम, नंबर, 4 एक्शन */
+function ContactCardModal({
+  card,
+  ring,
+  onClose,
+  onMessage,
+  onCall,
+  onViewStatus,
+}: {
+  card: { name: string; phone: string; avatar: string };
+  ring: RingState;
+  onClose: () => void;
+  onMessage: () => void;
+  onCall: (kind: CallKind) => void;
+  onViewStatus: () => void;
+}) {
+  const [info, setInfo] = useState(false);
+  const actionCls =
+    "flex flex-1 flex-col items-center gap-1.5 rounded-2xl py-2.5 text-[11px] font-medium text-emerald-600 transition-transform active:scale-95 dark:text-emerald-300";
+  const circ = "flex size-11 items-center justify-center rounded-full bg-emerald-50 dark:bg-emerald-900/30";
+  return (
+    <div
+      className="fixed inset-0 z-[66] flex items-center justify-center bg-black/60 p-6 backdrop-blur-sm"
+      role="dialog"
+      aria-modal="true"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-xs overflow-hidden rounded-3xl bg-white text-zinc-900 shadow-2xl dark:bg-zinc-900 dark:text-white"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="relative flex h-64 items-center justify-center bg-gradient-to-br from-emerald-500 to-teal-600">
+          <div
+            className={cn(
+              "flex size-44 items-center justify-center overflow-hidden rounded-full text-8xl",
+              ring === "new" && "ring-4 ring-emerald-300",
+              ring === "seen" && "ring-4 ring-zinc-300",
+              ring === "none" && "ring-4 ring-white/30",
+              "bg-white/20",
+            )}
+          >
+            <AvatarFace avatar={card.avatar} />
+          </div>
+          <button
+            type="button"
+            aria-label="Close"
+            onClick={onClose}
+            className="absolute right-3 top-3 rounded-full bg-black/30 p-1.5 text-white"
+          >
+            <X className="size-4" />
+          </button>
+          <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/60 to-transparent px-4 pb-3 pt-8 text-white">
+            <p className="truncate text-base font-bold">{card.name}</p>
+            <p className="text-xs opacity-90">+91 {card.phone}</p>
+          </div>
+        </div>
+
+        <div className="flex items-start justify-around px-2 py-2">
+          <button type="button" onClick={onMessage} className={actionCls}>
+            <span className={circ}>
+              <MessagesSquare className="size-5" />
+            </span>
+            Message
+          </button>
+          <button type="button" onClick={() => onCall("audio")} className={actionCls}>
+            <span className={circ}>
+              <Phone className="size-5" />
+            </span>
+            Voice
+          </button>
+          <button type="button" onClick={() => onCall("video")} className={actionCls}>
+            <span className={circ}>
+              <Video className="size-5" />
+            </span>
+            Video
+          </button>
+          <button type="button" onClick={() => setInfo((v) => !v)} className={actionCls}>
+            <span className={circ}>
+              <Info className="size-5" />
+            </span>
+            Info
+          </button>
+        </div>
+
+        {info ? (
+          <div className="mx-4 mb-3 space-y-1 rounded-2xl bg-zinc-100 p-3 text-xs dark:bg-zinc-800">
+            <p>
+              <span className="text-zinc-500">नाम:</span> {card.name}
+            </p>
+            <p>
+              <span className="text-zinc-500">मोबाइल:</span> +91 {card.phone}
+            </p>
+            <p>
+              <span className="text-zinc-500">Status:</span>{" "}
+              {ring === "new" ? "नया status है" : ring === "seen" ? "देखा जा चुका" : "कोई status नहीं"}
+            </p>
+          </div>
+        ) : null}
+
+        {ring !== "none" ? (
+          <button
+            type="button"
+            onClick={onViewStatus}
+            className="mx-4 mb-4 flex h-10 w-[calc(100%-2rem)] items-center justify-center gap-2 rounded-2xl bg-emerald-500 text-sm font-semibold text-white active:scale-95"
+          >
+            <CircleDashed className="size-4" /> Status देखें
+          </button>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* चैट सूची: पिछली लिस्ट तुरंत, फिर ताज़ा (ऑफ़लाइन में भी खाली नहीं)       */
+/* ------------------------------------------------------------------ */
+
+function useRealChats(myPhone?: string) {
+  const me = cleanNumber(myPhone);
+  const [rows, setRows] = useState<ChatRow[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  // पिछली बार की लिस्ट तुरंत दिखाओ (नेटवर्क का इंतज़ार नहीं)
+  useEffect(() => {
+    if (me.length !== 10) return;
+    try {
+      const v = JSON.parse(localStorage.getItem(`pci_chat_rows_${me}`) || "[]");
+      if (Array.isArray(v) && v.length) setRows((cur) => (cur.length ? cur : (v as ChatRow[])));
+    } catch {
+      /* ignore */
+    }
+  }, [me]);
+
+  useEffect(() => {
+    if (me.length !== 10) {
+      setRows([]);
+      return;
+    }
+    let active = true;
+    setLoading(true);
+
+    async function fetchLatest(): Promise<any[] | null> {
+      // तेज़ रास्ता: हर बातचीत का सिर्फ़ आख़िरी मैसेज (SQL फ़ंक्शन pci_recent_chats)
+      try {
+        const rpc = await dbx.rpc("pci_recent_chats", { p_me: me, p_limit: 150 });
+        if (!rpc.error && Array.isArray(rpc.data)) return rpc.data as any[];
+      } catch {
+        /* फ़ंक्शन नहीं बना */
+      }
+      // पुराना रास्ता, पर सीमित
+      try {
+        const { data, error } = await supabase
+          .from("messages")
+          .select("sender_phone, receiver_phone, text, created_at, delivered_at")
+          .or(`sender_phone.eq.${me},receiver_phone.eq.${me}`)
+          .order("created_at", { ascending: false })
+          .limit(1500);
+        if (error) {
+          console.error("Supabase error:", error);
+          return null;
+        }
+        return (data ?? []) as any[];
+      } catch (e) {
+        console.error("chats fetch failed:", e);
+        return null; // ऑफ़लाइन: पिछली लिस्ट बनी रहे
+      }
+    }
+
+    async function load() {
+      const msgs = await fetchLatest();
+      if (!active) return;
+      if (msgs === null) {
+        setLoading(false);
+        return;
+      }
+      if (msgs.length === 0) {
+        setRows([]);
+        setLoading(false);
+        return;
+      }
+
+      // ऐप खुला है: मुझे आए सारे अनदेखे मैसेज "Delivered" चिह्नित करो
+      if (msgs.some((m) => cleanNumber(m.receiver_phone) === me && !m.delivered_at)) {
+        const { error: dErr } = await supabase
+          .from("messages")
+          .update({ delivered_at: new Date().toISOString() })
+          .eq("receiver_phone", me)
+          .is("delivered_at", null);
+        if (dErr) console.error("Supabase error:", dErr);
+      }
+
+      // हर बातचीत का सबसे नया मैसेज (msgs पहले से नए-से-पुराना क्रम में हैं)
+      const latest = new Map<string, { text: string; created_at: string }>();
+      for (const m of msgs) {
+        const s = cleanNumber(m.sender_phone);
+        const other = s === me ? cleanNumber(m.receiver_phone) : s;
+        if (other && !latest.has(other)) latest.set(other, { text: m.text, created_at: m.created_at });
+      }
+
+      const phones = [...latest.keys()].slice(0, 150);
+      const profiles = await queryProfiles((cols) =>
+        dbx
+          .from("profiles")
+          .select(cols)
+          .in(
+            "phone",
+            phones.flatMap((p) => [p, `+91${p}`, `91${p}`]),
+          ),
+      );
+
+      const built: ChatRow[] = phones.map((phone) => {
+        const p = profiles.find((x) => cleanNumber(x.phone) === phone);
+        const l = latest.get(phone)!;
+        return {
+          name: profName(p) || phone,
+          msg: previewLabel(l.text),
+          time: compactTime(l.created_at),
+          createdAt: l.created_at,
+          unread: 0,
+          avatar: profAvatar(p),
+          phone,
+        };
+      });
+
+      // सबसे नया मैसेज सबसे ऊपर
+      built.sort((a, b) => ts(b.createdAt) - ts(a.createdAt));
+      if (active) {
+        setRows(built);
+        setLoading(false);
+        try {
+          // base64 फ़ोटो cache में न डालें (localStorage भर जाता है)
+          const slim = built.slice(0, 60).map((b) => (b.avatar.startsWith("data:") ? { ...b, avatar: "🙂" } : b));
+          localStorage.setItem(`pci_chat_rows_${me}`, JSON.stringify(slim));
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+
+    void load();
+
+    // मैसेज झुंड में आएँ तो एक ही बार reload
+    let timer = 0;
+    const reloadSoon = () => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => void load(), 350);
+    };
+    const channel = supabase
+      .channel(`home-conversations-${me}-${Math.random().toString(36).slice(2, 8)}`)
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "messages" }, (payload) => {
+        const m = payload.new as { sender_phone: string; receiver_phone: string };
+        if (cleanNumber(m.sender_phone) === me || cleanNumber(m.receiver_phone) === me) reloadSoon();
+      })
+      .subscribe();
+    window.addEventListener("pci-back-online", reloadSoon);
+
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+      window.removeEventListener("pci-back-online", reloadSoon);
+      supabase.removeChannel(channel);
+    };
+  }, [me]);
+
+  return { rows, loading };
+}
+
+/** मेरे असली ग्रुप (Supabase groups + group_members) और हर ग्रुप का आख़िरी मैसेज */
+function useRealGroups(myPhone?: string) {
+  const me = cleanNumber(myPhone);
+  const [groupRows, setGroupRows] = useState<GroupRow[]>([]);
+  const idsRef = useRef<Set<string>>(new Set());
+
+  // पिछली बार की ग्रुप सूची तुरंत (ऑफ़लाइन में भी दिखे)
+  useEffect(() => {
+    if (me.length !== 10) return;
+    try {
+      const v = JSON.parse(localStorage.getItem(`pci_group_rows_${me}`) || "[]");
+      if (Array.isArray(v) && v.length) {
+        setGroupRows((cur) => (cur.length ? cur : (v as GroupRow[])));
+        idsRef.current = new Set((v as GroupRow[]).map((g) => String(g.id)));
+      }
+    } catch {
+      /* ignore */
+    }
+  }, [me]);
+
+  const load = useCallback(async () => {
+    if (me.length !== 10) {
+      idsRef.current = new Set();
+      setGroupRows([]);
+      return;
+    }
+    try {
+      const { data: mine, error } = await supabase
+        .from("group_members")
+        .select("group_id, groups(id, name, avatar, created_at)")
+        .eq("phone", me);
+      if (error) throw error;
+
+      const list = (mine ?? []) as any[];
+      const ids = list.map((r) => String(r.group_id)).filter(Boolean);
+      idsRef.current = new Set(ids);
+      if (ids.length === 0) {
+        setGroupRows([]);
+        try {
+          localStorage.removeItem(`pci_group_rows_${me}`);
+        } catch {
+          /* ignore */
+        }
+        return;
+      }
+
+      const [memRes, msgRes] = await Promise.all([
+        supabase.from("group_members").select("group_id, phone").in("group_id", ids),
+        supabase
+          .from("group_messages")
+          .select("group_id, sender_phone, text, created_at")
+          .in("group_id", ids)
+          .order("created_at", { ascending: false })
+          .limit(400);
+      ]);
+
+const membersBy = new Map<string, string[]>();
+      for (const r of (memRes.data ?? []) as any[]) {
+        const gid = String(r.group_id);
+        const arr = membersBy.get(gid) ?? [];
+        arr.push(cleanNumber(String(r.phone)));
+        membersBy.set(gid, arr);
+      }
+
+      const lastBy = new Map<string, any>();
+      for (const m of (msgRes.data ?? []) as any[]) {
+        const gid = String(m.group_id);
+        if (!lastBy.has(gid)) lastBy.set(gid, m);
+      }
+
+      const built: GroupRow[] = [];
+      for (const r of list) {
+        const g = Array.isArray(r.groups) ? r.groups[0] : r.groups;
+        if (!g) continue;
+        const gid = String(g.id);
+        const last = lastBy.get(gid);
+        built.push({
+          id: gid,
+          name: String(g.name ?? "Group"),
+          avatar: String(g.avatar || "👥"),
+          createdAt: String(g.created_at ?? ""),
+          memberPhones: membersBy.get(gid) ?? [me],
+          ...(last
+            ? {
+                lastText: String(last.text ?? ""),
+                lastSender: cleanNumber(String(last.sender_phone ?? "")),
+                lastAt: String(last.created_at ?? ""),
+              }
+            : {}),
+        });
+      }
+      setGroupRows(built);
+      try {
+        const slim = built.map((g) => (g.avatar.startsWith("data:") ? { ...g, avatar: "👥" } : g));
+        localStorage.setItem(`pci_group_rows_${me}`, JSON.stringify(slim));
+      } catch {
+        /* ignore */
+      }
+    } catch (e) {
+      console.error("groups load failed:", e);
+    }
+  }, [me]);
+
+  useEffect(() => {
+    void load();
+    if (me.length !== 10) return;
+
+    const onChanged = () => void load();
+    window.addEventListener("pci-groups-changed", onChanged);
+    window.addEventListener("pci-back-online", onChanged);
+
+    const channel = supabase
+      .channel(`home-groups-${me}-${Math.random().toString(36).slice(2, 8)}`)
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "group_members" }, (payload) => {
+        const r = payload.new as { phone?: string };
+        if (cleanNumber(r.phone ?? "") === me) void load();
+      })
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "group_messages" }, (payload) => {
+        const m = payload.new as { group_id?: string };
+        if (m.group_id && idsRef.current.has(String(m.group_id))) void load();
+      })
+      .subscribe();
+
+    return () => {
+      window.removeEventListener("pci-groups-changed", onChanged);
+      window.removeEventListener("pci-back-online", onChanged);
+      supabase.removeChannel(channel);
+    };
+  }, [load, me]);
+
+  return { groupRows, reloadGroups: load };
+}
+
+/* ------------------------------------------------------------------ */
+/* Home                                                                */
+/* ------------------------------------------------------------------ */
+
+function Home() {
+  const navigate = useNavigate();
+  const search = Route.useSearch();
+  const { state, update, hydrated } = useAppState();
+  const t = useMemo(() => makeT(state.lang), [state.lang]);
+
+  const { guard, modal } = useCallGuard();
+  const appBgStyle = useAppBackgroundStyle();
+  const hasAppBg =
+    !!appBgStyle && typeof appBgStyle === "object" && Object.keys(appBgStyle as object).length > 0;
+
+  // पुराने ?tab=business लिंक -> Group टैब का Business हिस्सा
+  const initialTab: TabKey =
+    search.tab === "settings" ? "chats" : search.tab === "business" ? "groups" : (search.tab ?? "chats");
+
+  const [permsDone, setPermsDone] = useState(readPermsDone);
+  const [tab, setTabState] = useState<TabKey>(initialTab);
+  const [groupSide, setGroupSide] = useState<GroupSide>(search.tab === "business" ? "business" : "groups");
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [bizOpen, setBizOpen] = useState(false);
+  const [bizSetupOpen, setBizSetupOpen] = useState(false);
+  const [bizSetup, setBizSetup] = useState<BizSetup | null>(null);
+  const [query, setQuery] = useState("");
+  const [chip, setChip] = useState<Chip>("All");
+  const [activeChat, setActiveChatState] = useState<ActiveChat | null>(null);
+  const [groupOpen, setGroupOpen] = useState(false);
+  const [profileSignal] = useState(0);
+  const [chatTimerPromptOpen, setChatTimerPromptOpen] = useState(false);
+  const [liveCall, setLiveCall] = useState<{ name: string; avatar: string; kind: CallKind; phone: string } | null>(null);
+  const [showInvite, setShowInvite] = useState(false);
+  const [unregisteredCallPrompt, setUnregisteredCallPrompt] = useState<
+    { name: string; phone: string } | null
+  >(null);
+  const [phoneContacts, setPhoneContacts] = useState<PhoneContact[]>([]);
+  const [contactsLoaded, setContactsLoaded] = useState(false);
+  const [syncingContacts, setSyncingContacts] = useState(false);
+  const [statusSubTab, setStatusSubTab] = useState<StatusSubTab>("status");
+  const [isMuted, setIsMuted] = useState(true);
+  const [dark, setDark] = useState(() =>
+    typeof document !== "undefined" ? document.documentElement.classList.contains("dark") : false,
+  );
+  const [, setNowTick] = useState(0);
+
+  // फ़ोनबुक सिंक (नेटिव प्लगइन)
+  const [showBat, setShowBat] = useState(false);
+
+  useEffect(() => {
+    if (state?.profile?.phone) {
+      void registerNativePush(state.profile.phone);
+    }
+    if (shouldShowBatteryGuide()) {
+      setShowBat(true);
+    }
+  }, [state?.profile?.phone]);
+
+  const handleSyncContacts = async () => {
+    if (syncingContacts) return;
+    setSyncingContacts(true);
+    try {
+      const list = await syncPhoneContacts();
+      const next = normalizeContacts(list);
+      setPhoneContacts(next);
+      saveContacts(next);
+      alert(`${next.length} कॉन्टैक्ट्स सिंक हुए!`);
+    } catch (e: any) {
+      alert(e?.message || "Contacts सिंक नहीं हो सके");
+    } finally {
+      setSyncingContacts(false);
+    }
+  };
+
+  // स्क्रीनशॉट-रोक सुरक्षा शुरू में ही (इसे टाला नहीं जाता)
+  useEffect(() => {
+    initScreenSecure();
+  }, []);
+
+  // पुराने लिंक ?tab=settings से आए तो सेटिंग्स शीट खोल दो
+  useEffect(() => {
+    if (search.tab === "settings") setSettingsOpen(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    const saved = loadContacts();
+    setPhoneContacts(saved);
+    try {
+      if (saved.length > 0 && !localStorage.getItem(CONTACTS_KEY)) saveContacts(saved);
+    } catch {
+      /* ignore */
+    }
+    setContactsLoaded(true);
+  }, []);
+
+  useEffect(() => {
+    setIsMuted(readMuted());
+  }, []);
+
+  // प्रोफ़ाइल फ़ोटो: ऐप खुलते ही localStorage से तुरंत (किसी नेटवर्क कॉल से पहले) वापस लाओ
+  useEffect(() => {
+    if (!hydrated) return;
+    if (state.profile?.photo) return;
+    try {
+      let photo = localStorage.getItem("pci_profile_avatar") || "";
+      if (!photo) {
+        const raw = localStorage.getItem("pci_profile");
+        if (raw) photo = (JSON.parse(raw) as { photo?: string } | null)?.photo ?? "";
+      }
+      if (photo) update({ profile: { ...state.profile, photo } });
+    } catch {
+      /* ignore */
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hydrated]);
+
+  useEffect(() => {
+    const px = FONT_SCALE[state.theme.fontSize ?? "base"] ?? FONT_SCALE.base;
+    document.documentElement.style.fontSize = px;
+    return () => {
+      document.documentElement.style.fontSize = "";
+    };
+  }, [state.theme.fontSize]);
+
+  const toggleMute = () => {
+    setIsMuted((m) => {
+      const next = !m;
+      writeMuted(next);
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    if (hydrated && !state.onboarded) navigate({ to: "/" });
+  }, [hydrated, state.onboarded, navigate]);
+
+  const toggleDark = () => {
+    const next = !dark;
+    setDark(next);
+    document.documentElement.classList.toggle("dark", next);
+  };
+
+  const { rows: realChats, loading: chatsLoading } = useRealChats(state.profile.phone);
+  const { groupRows, reloadGroups } = useRealGroups(state.profile.phone);
+  const statusMap = useActiveStatuses();
+  const bizPhones = useBusinessPhones();
+  const { seen: seenMap, markSeen } = useSeenStatuses();
+  const ringOf = (phone?: string): RingState => {
+    const p = cleanNumber(phone ?? "");
+    const latest = p ? statusMap.get(p) : undefined;
+    if (!latest) return "none";
+    return (seenMap[p] ?? 0) >= latest ? "seen" : "new";
+  };
+  const [profileCard, setProfileCard] = useState<{ name: string; phone: string; avatar: string } | null>(null);
+
+  const queryDigits = query.replace(/\D/g, "");
+  const isSearching = query.trim() !== "";
+  const myClean = cleanNumber(state.profile.phone);
+
+  // भारी शुरुआती काम पहली स्क्रीन के बाद: मेरी प्रोफ़ाइल बनी रहे + "Online" दिखे
+  useEffect(() => {
+    if (myClean.length !== 10) return;
+    return runWhenIdle(() => {
+      void ensureMyProfile(myClean);
+      startPresence(myClean);
+    }, 2000);
+  }, [myClean]);
+
+  // Business की जानकारी (एक बार भरवाई जाती है)
+  useEffect(() => {
+    setBizSetup(loadBizSetup(myClean));
+  }, [myClean]);
+
+  /** Business दबाते ही: जानकारी भरी नहीं है तो पहले फ़ॉर्म, भरी है तो सीधे पेज */
+  const selectBusinessSide = () => {
+    if (!bizSetup) {
+      setBizSetupOpen(true);
+      return;
+    }
+    setGroupSide("business");
+  };
+
+  // नंबर -> सेव किया हुआ नाम (नहीं हो तो नंबर ही)
+  const phoneName = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const c of phoneContacts) m.set(c.phone, c.name);
+    return (p: string) => {
+      const n = cleanNumber(p);
+      return m.get(n) ?? (n || p);
+    };
+  }, [phoneContacts]);
+
+  const [lookupResults, setLookupResults] = useState<
+    { phone: string; name: string | null; avatar: string | null }[]
+  >([]);
+
+  useEffect(() => {
+    if (queryDigits.length < 4) {
+      setLookupResults([]);
+      return;
+    }
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      const pattern = `%${queryDigits.split("").join("%")}%`;
+      const rows = await queryProfiles((cols) => dbx.from("profiles").select(cols).ilike("phone", pattern).limit(5));
+      if (cancelled) return;
+      setLookupResults(
+        rows
+          .map((r) => ({ phone: String(r.phone ?? ""), name: profName(r) || null, avatar: profAvatar(r) }))
+          .filter((r) => cleanNumber(r.phone) !== myClean),
+      );
+    }, 300);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [queryDigits, myClean]);
+
+  // नंबर -> उस बातचीत की पंक्ति (आख़िरी मैसेज + समय)
+  const chatByPhone = useMemo(() => {
+    const m = new Map<string, ChatRow>();
+    for (const c of realChats) if (c.phone) m.set(c.phone, c);
+    return m;
+  }, [realChats]);
+
+  // असली ग्रुप -> लिस्ट की पंक्तियाँ
+  const groupChats = useMemo<ChatRow[]>(
+    () =>
+      groupRows.map((g) => {
+        const at = g.lastAt ?? g.createdAt;
+        const msg = g.lastText
+          ? `${g.lastSender === myClean ? "You" : phoneName(g.lastSender ?? "")}: ${previewLabel(g.lastText)}`
+          : "Group created";
+        return {
+          name: g.name,
+          avatar: g.avatar,
+          msg,
+          time: compactTime(at),
+          createdAt: at,
+          unread: 0,
+          groupId: g.id,
+          memberPhones: g.memberPhones,
+          members: g.memberPhones.filter((p) => p !== myClean).map(phoneName),
+        };
+      }),
+    [groupRows, phoneName, myClean],
+  );
+
+  // सारी बातचीतें (ग्रुप + असली चैट), सबसे नई सबसे ऊपर
+  const allChats = useMemo(() => {
+    const named = realChats.map((c) => {
+      const pc = c.phone ? phoneContacts.find((p) => p.phone === c.phone) : undefined;
+      return pc ? { ...c, name: pc.name } : c;
+    });
+    return [...groupChats, ...named].sort((a, b) => ts(b.createdAt) - ts(a.createdAt));
+  }, [groupChats, realChats, phoneContacts]);
+
+  // Business चैट: दुकानदार/बिज़नेस नंबर से हुई बातचीत
+  const businessChats = useMemo(
+    () => allChats.filter((c) => !c.groupId && c.phone && bizPhones.has(c.phone)),
+    [allChats, bizPhones],
+  );
+
+  const chats = useMemo(() => {
+    const q = query.toLowerCase();
+    return allChats
+      .filter((c) => c.name.toLowerCase().includes(q) || (queryDigits !== "" && (c.phone ?? "").includes(queryDigits)))
+      .filter((c) => inBucket(c.createdAt, chip));
+  }, [allChats, query, queryDigits, chip]);
+
+  // "Recent chats" में वही जो सेव कॉन्टैक्ट नहीं हैं (ग्रुप भी यहीं)
+  const recentChats = useMemo(
+    () => chats.filter((c) => !c.phone || !phoneContacts.some((p) => p.phone === c.phone)),
+    [chats, phoneContacts],
+  );
+
+  const rowToContact = (c: ChatRow): ActiveChat => ({
+    name: c.name,
+    avatar: c.avatar,
+    msg: c.msg,
+    ...(c.members ? { members: c.members } : {}),
+    ...(c.phone ? { phone: c.phone } : {}),
+    ...(c.groupId ? { groupId: c.groupId, memberPhones: c.memberPhones ?? [] } : {}),
+  });
+
+  useEffect(() => {
+    if (!search.chat || activeChat) return;
+    const found = allChats.find((c) => c.name === search.chat);
+    if (found) setActiveChatState(rowToContact(found));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allChats]);
+
+  const markBannerSeen = useCallback(() => update({ bannerSeen: true }), [update]);
+
+  // replace: true — हर टैब/चैट बदलाव history में न जुड़े, वरना Android back उलझता है
+  const setTab = (k: TabKey) => {
+    setTabState(k);
+    navigate({ search: (prev: any) => ({ ...prev, tab: k, chat: undefined }), replace: true });
+  };
+
+  const setActiveChat = (c: ActiveChat | null) => {
+    setActiveChatState(c);
+    navigate({ search: (prev: any) => ({ ...prev, chat: c?.name }), replace: true });
+    if (c && hydrated && !state.disappearingPromptSeen) setChatTimerPromptOpen(true);
+  };
+
+  const openTab = (k: TabKey) => {
+    if (k === "settings") {
+      setActiveChat(null);
+      setSettingsOpen(true);
+      return;
+    }
+    if (k === "business") {
+      // Business अब Group टैब के अंदर है
+      setTab("groups");
+      selectBusinessSide();
+      setActiveChat(null);
+      return;
+    }
+    setTab(k);
+    setActiveChat(null);
+    if (k === "status") setStatusSubTab("status");
+  };
+
+  const openContactChat = (c: PhoneContact) => {
+    setQuery("");
+    setActiveChat({ name: c.name || c.phone, avatar: c.avatar || "🙂", msg: "", phone: c.phone });
+  };
+
+  /** नंबर से चैट खोलो (Calls टैब, Status और Reels से); सेव कॉन्टैक्ट हो तो उसका नाम/avatar */
+  const openChatByPhone = (phone: string, fallbackName?: string) => {
+    const p = cleanNumber(phone);
+    const c = phoneContacts.find((x) => x.phone === p);
+    setActiveChat({ name: c?.name || fallbackName || p, avatar: c?.avatar || "🙂", msg: "", phone: p });
+  };
+
+  // ---- Push (FCM): टोकन सेव; notification पर tap करने से सही चैट/कॉल खुले ----
+  const openChatRef = useRef(openChatByPhone);
+  openChatRef.current = openChatByPhone;
+
+  useEffect(() => {
+    if (!permsDone) return;
+    return runWhenIdle(() => {
+      void initNativePush({
+        onOpenChat: (phone) => openChatRef.current(phone),
+        onOpenCall: (c) => {
+          try {
+            window.dispatchEvent(new CustomEvent("pci-open-call", { detail: c }));
+          } catch {
+            /* ignore */
+          }
+        },
+      });
+    }, 2500);
+  }, [permsDone]);
+
+  useEffect(() => {
+    if (permsDone && myClean.length === 10) void syncPushToken(myClean);
+  }, [permsDone, myClean]);
+
+  const handleContactUpdate = (oldPhone: string, data: { name: string; phone: string }) => {
+    const phone = cleanNumber(data.phone);
+    const name = data.name.trim() || phone;
+    const existing = phoneContacts.find((c) => c.phone === oldPhone);
+    const next: PhoneContact[] = [
+      ...phoneContacts.filter((c) => c.phone !== oldPhone && c.phone !== phone),
+      { name, phone, avatar: existing?.avatar ?? "🙂" },
+    ];
+    setPhoneContacts(next);
+    saveContacts(next);
+    setActiveChatState((prev) => (prev ? { ...prev, name, phone } : prev));
+  };
+
+  /** नया ग्रुप: Supabase में groups + group_members, फिर ग्रुप चैट खोलो */
+  const createGroup = async (name: string, members: Array<{ name: string; phone: string }>) => {
+    if (myClean.length !== 10) {
+      alert("ग्रुप बनाने के लिए पहले अपना नंबर सेट करें।");
+      return;
+    }
+    const groupName = name.trim() || "New Group";
+    try {
+      // पहले क्लाइंट-साइड id के साथ कोशिश (RLS में insert().select() अक्सर रुकता है,
+      // क्योंकि बनाने वाला अभी member नहीं होता); न चले तो पुराना तरीका
+      let gid: string | null = null;
+      const newId = (globalThis as any).crypto?.randomUUID?.() as string | undefined;
+      if (newId) {
+        const { error: e0 } = await supabase
+          .from("groups")
+          .insert({ id: newId, name: groupName, avatar: "👥", created_by: myClean });
+        if (!e0) gid = newId;
+      }
+      if (!gid) {
+        const { data: g, error } = await supabase
+          .from("groups")
+          .insert({ name: groupName, avatar: "👥", created_by: myClean })
+          .select()
+          .single();
+        if (error || !g) throw error ?? new Error("group not created");
+        gid = String(g.id);
+      }
+
+      const phones = [...new Set([myClean, ...members.map((m) => cleanNumber(m.phone))])].filter(
+        (p) => p.length === 10,
+      );
+      const rows = phones.map((p) => ({ group_id: gid, phone: p, role: p === myClean ? "admin" : "member" }));
+      const { error: e2 } = await supabase.from("group_members").insert(rows);
+      if (e2) {
+        try {
+          await supabase.from("groups").delete().eq("id", gid);
+        } catch {
+          /* ignore */
+        }
+        throw e2;
+      }
+
+      void reloadGroups();
+      setActiveChat({
+        name: groupName,
+        avatar: "👥",
+        msg: "",
+        members: phones.filter((p) => p !== myClean).map(phoneName),
+        groupId: String(gid),
+        memberPhones: phones,
+      });
+    } catch (e: any) {
+      console.error("create group failed:", e);
+      alert("ग्रुप नहीं बन पाया: " + (e?.message ?? "इंटरनेट/सर्वर की दिक्कत"));
+    }
+  };
+
+  const verifyAndCall = async (c: PhoneContact, kind: CallKind) => {
+    if (cleanNumber(c.phone) === myClean) {
+      alert("अपने ही नंबर पर कॉल नहीं कर सकते।");
+      return;
+    }
+    try {
+      const res = await Promise.race([
+        checkRegistered(c.phone),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), 6000)),
+      ]);
+      if (res.status === "found") {
+        setLiveCall({ name: c.name, avatar: c.avatar, kind, phone: c.phone });
+      } else {
+        setUnregisteredCallPrompt({ name: c.name, phone: c.phone });
+      }
+    } catch {
+      setUnregisteredCallPrompt({ name: c.name, phone: c.phone });
+    }
+  };
+
+  function startNewChat(rawPhone: string) {
+    const digits = cleanNumber(rawPhone);
+    if (digits.length !== 10) {
+      alert("कृपया सही 10 अंकों का मोबाइल नंबर डालें।");
+      return;
+    }
+    setQuery("");
+    setActiveChat({ name: digits, avatar: "🙂", msg: "", phone: digits });
+  }
+
+  // Canva-style रंगीन bottom nav: chat bubble, ⭐ वाले लोग, shopping bag, heart story ring, हरा फ़ोन
+  const BOTTOM_NAV: Array<{
+    key: string;
+    label: string;
+    Icon: (p: { className?: string }) => React.ReactElement;
+    tint: string;
+    labelCls: string;
+    onClick: () => void;
+    active: boolean;
+  }> = [
+    {
+      key: "chats",
+      label: "Chats",
+      Icon: ChatNavIcon,
+      tint: "bg-emerald-100 dark:bg-emerald-500/20",
+      labelCls: "text-emerald-600 dark:text-emerald-300",
+      onClick: () => openTab("chats"),
+      active: tab === "chats",
+    },
+    {
+      key: "groups",
+      label: "Group",
+      Icon: GroupNavIcon,
+      tint: "bg-indigo-100 dark:bg-indigo-500/20",
+      labelCls: "text-indigo-600 dark:text-indigo-300",
+      onClick: () => openTab("groups"),
+      active: tab === "groups",
+    },
+    {
+      key: "shopping",
+      label: "Shop",
+      Icon: ShopNavIcon,
+      tint: "bg-orange-100 dark:bg-orange-500/20",
+      labelCls: "text-orange-600 dark:text-orange-300",
+      onClick: () => openTab("shopping"),
+      active: tab === "shopping",
+    },
+    {
+      key: "status",
+      label: "Status",
+      Icon: StoryNavIcon,
+      tint: "bg-pink-100 dark:bg-pink-500/20",
+      labelCls: "text-pink-600 dark:text-pink-300",
+      onClick: () => openTab("status"),
+      active: tab === "status",
+    },
+    {
+      key: "calls",
+      label: "Calls",
+      Icon: CallNavIcon,
+      tint: "bg-green-100 dark:bg-green-500/20",
+      labelCls: "text-green-600 dark:text-green-300",
+      onClick: () => openTab("calls"),
+      active: tab === "calls",
+    },
+  ];
+
+  // "1M", "5M" जैसे समय-लेबल अपने-आप ताज़ा होते रहें
+  useEffect(() => {
+    const iv = setInterval(() => setNowTick((x) => x + 1), 30000);
+    return () => clearInterval(iv);
+  }, []);
+
+  // सेव कॉन्टैक्ट्स: जिससे आख़िरी बातचीत सबसे नई, वो सबसे ऊपर; बाकी A-Z
+  const sortedPhoneContacts = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return phoneContacts
+      .map((c) => ({ c, last: chatByPhone.get(c.phone) }))
+      .filter(
+        ({ c }) =>
+          !q || c.name.toLowerCase().includes(q) || (queryDigits !== "" && c.phone.includes(queryDigits)),
+      )
+      .filter(({ last }) => inBucket(last?.createdAt, chip))
+      .sort((a, b) => {
+        const ta = ts(a.last?.createdAt);
+        const tb = ts(b.last?.createdAt);
+        if (ta !== tb) return tb - ta;
+        return a.c.name.localeCompare(b.c.name);
+      });
+  }, [phoneContacts, chatByPhone, query, queryDigits, chip]);
+
+  const extraLookup = useMemo(
+    () => lookupResults.filter((u) => !phoneContacts.some((p) => p.phone === cleanNumber(u.phone))),
+    [lookupResults, phoneContacts],
+  );
+
+  const nothingFound =
+    isSearching && sortedPhoneContacts.length === 0 && extraLookup.length === 0 && recentChats.length === 0;
+
+  const privacy = (state.privacy ?? {}) as any;
+  const readReceiptsOn = privacy.readReceipts !== false;
+  const disappearHours = DISAPPEAR_HOURS[String(state.disappearingMessages ?? "off")] ?? 0;
+
+  // ---- Android back: सबसे ऊपर खुली layer पहले बंद; कुछ न खुला हो तभी ऐप minimize ----
+  // (ChatScreen, StatusPanel, ReelsFeed आदि के अंदर की layers भी यही shared hook इस्तेमाल करती हैं)
+  useBackLayer(tab !== "chats", () => setTab("chats"));
+  useBackLayer(Boolean(activeChat), () => setActiveChat(null));
+  useBackLayer(settingsOpen, () => setSettingsOpen(false));
+  useBackLayer(bizOpen, () => setBizOpen(false));
+  useBackLayer(bizSetupOpen, () => setBizSetupOpen(false));
+  useBackLayer(groupOpen, () => setGroupOpen(false));
+  useBackLayer(Boolean(liveCall), () => setLiveCall(null));
+  useBackLayer(tab === "status" && statusSubTab === "reels", () => setStatusSubTab("status"));
+  useBackLayer(chatTimerPromptOpen, () => {
+    update({ disappearingPromptSeen: true });
+    setChatTimerPromptOpen(false);
+  });
+  useBackLayer(Boolean(unregisteredCallPrompt), () => setUnregisteredCallPrompt(null));
+  useBackLayer(showInvite, () => setShowInvite(false));
+  useBackLayer(Boolean(profileCard), () => setProfileCard(null));
+
+  if (!permsDone) return <PermissionGate onDone={() => setPermsDone(true)} />;
+
+  return (
+    <main
+      style={appBgStyle}
+      className={cn(
+        "relative h-[100dvh] overflow-hidden overflow-x-hidden transition-colors duration-200",
+        SURFACE_CLASSES[(state.theme as any)?.surfaceColor ?? "default"] ?? SURFACE_CLASSES.default,
+      )}
+    >
+      <Wallpaper wallpaper={state.theme.appWallpaper} />
+      {hydrated && !state.bannerSeen ? (
+        <SlideBanner
+          title="Welcome to Pro Chat India"
+          message="Glass themes, in-app keypad and business tools — built for your privacy."
+          duration={4000}
+          onDone={markBannerSeen}
+        />
+      ) : null}
+
+      <div className="relative mx-auto flex h-full w-full max-w-md flex-col lg:max-w-none lg:flex-row">
+        <ConnectionBanner />
+        <div
+          className={cn(
+            "flex h-full min-w-0 flex-1 flex-col lg:max-w-md lg:border-e lg:border-border/60",
+            activeChat && "hidden lg:flex",
+          )}
+        >
+          <header className="shrink-0 rounded-b-3xl bg-emerald-500 px-4 pt-6 pb-4 text-white shadow-md">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex min-w-0 items-center gap-2">
+                <AppIcon variant={state.theme.appIcon} className="size-8 shrink-0" />
+                <h1 className="font-display truncate text-lg font-bold">Pro Chat India</h1>
+              </div>
+              <div className="flex shrink-0 items-center gap-1.5">
+                <button
+                  type="button"
+                  aria-label="Toggle theme"
+                  onClick={toggleDark}
+                  className="flex size-9 items-center justify-center rounded-full bg-white/15 transition-colors hover:bg-white/25 active:scale-90"
+                >
+                  {dark ? <Sun className="size-4.5" /> : <Moon className="size-4.5" />}
+                </button>
+                <button
+                  type="button"
+                  aria-label={isMuted ? "Unmute videos" : "Mute videos"}
+                  onClick={toggleMute}
+                  className="flex size-9 items-center justify-center rounded-full bg-white/15 transition-colors hover:bg-white/25 active:scale-90"
+                >
+                  {isMuted ? <BellOff className="size-4.5" /> : <Bell className="size-4.5" />}
+                </button>
+                <button
+                  type="button"
+                  aria-label="Profile and settings"
+                  onClick={() => setSettingsOpen(true)}
+                  className="flex size-10 items-center justify-center overflow-hidden rounded-full bg-white/20 text-xl ring-2 ring-white/50 transition-all active:scale-90"
+                >
+                  {state.profile.photo ? (
+                    <img src={state.profile.photo} alt="You" className="size-full object-cover" />
+                  ) : (
+                    state.profile.avatar || "🙂"
+                  )}
+                </button>
+              </div>
+            </div>
+
+            {tab === "chats" ? (
+              <div className="relative mt-4">
+                <Search className="absolute top-1/2 start-4 size-4 -translate-y-1/2 text-zinc-400" />
+                <KeypadField
+                  value={query}
+                  onValueChange={setQuery}
+                  onPaste={(e: React.ClipboardEvent) => {
+                    const pasted = e.clipboardData.getData("text");
+                    if (pasted) setQuery(pasted.replace(/[^\d+ ]/g, "").trim());
+                  }}
+                  placeholder="Search name, number..."
+                  keypadStyle={state.theme.keypadStyle}
+                  mode="text"
+                  className="h-11 rounded-2xl border-0 bg-white ps-11 text-zinc-900 shadow-sm"
+                />
+              </div>
+            ) : null}
+          </header>
+
+          {tab === "chats" ? (
+            <div className="mx-auto flex w-full flex-wrap items-center justify-center gap-2 px-4 pt-3">
+              {(["All", "Today", "Weeks", "Month"] as Chip[]).map((c) => (
+                <CloudChip key={c} label={c} active={chip === c} onClick={() => setChip(c)} />
+              ))}
+            </div>
+          ) : null}
+
+          <section className="min-h-0 flex-1 overflow-y-auto">
+            <SafeBoundary key={tab} label="यह स्क्रीन" onReset={() => setTab("chats")}>
+              {tab === "chats" ? (
+                <div className="px-3 pb-28 pt-3 md:px-4 lg:pb-6">
+                  {!isSearching ? (
+                    <div className="mb-3 flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setGroupOpen(true)}
+                        className="flex min-w-0 flex-1 items-center gap-3 rounded-full bg-white px-4 py-3 text-start shadow-sm dark:bg-zinc-800"
+                      >
+                        <span className="flex size-11 shrink-0 items-center justify-center rounded-full bg-brand-gradient text-white shadow-glow">
+                          <Users className="size-5" />
+                        </span>
+                        <span className="text-sm font-semibold">+ New Group</span>
+                      </button>
+                      <button
+                        type="button"
+                        aria-label="Sync contacts"
+                        onClick={handleSyncContacts}
+                        disabled={syncingContacts}
+                        className="flex size-12 shrink-0 items-center justify-center rounded-full bg-white text-emerald-600 shadow-sm transition-transform active:scale-90 disabled:opacity-50 dark:bg-zinc-800"
+                      >
+                        <RefreshCw className={cn("size-5", syncingContacts && "animate-spin")} />
+                      </button>
+                    </div>
+                  ) : null}
+                  
+{/* सेव कॉन्टैक्ट्स: आख़िरी मैसेज के हिसाब से */}
+                  {sortedPhoneContacts.length > 0 ? (
+                    <div className="space-y-2">
+                      {sortedPhoneContacts.map(({ c, last }) => (
+                        <div
+                          key={c.phone}
+                          className="flex select-none items-center gap-2 rounded-[28px] bg-white p-3 shadow-sm dark:bg-zinc-800"
+                        >
+                          <button
+                            type="button"
+                            aria-label="View profile"
+                            onClick={() => setProfileCard({ name: c.name, phone: c.phone, avatar: c.avatar })}
+                            className="shrink-0 transition-transform active:scale-95"
+                          >
+                            <StatusRing state={ringOf(c.phone)}>
+                              <AvatarFace avatar={c.avatar} />
+                            </StatusRing>
+                          </button>
+                          <div className="min-w-0 flex-1">
+                            <p className="truncate text-sm font-semibold">{c.name}</p>
+                            <p className="truncate text-xs text-muted-foreground">{last ? last.msg : c.phone}</p>
+                          </div>
+                          {last ? (
+                            <span className="shrink-0 rounded-full bg-emerald-500 px-2 py-0.5 text-[10px] font-bold text-white">
+                              {compactTime(last.createdAt)}
+                            </span>
+                          ) : null}
+                          <button
+                            type="button"
+                            aria-label="Chat"
+                            onClick={() => openContactChat(c)}
+                            className="flex size-9 shrink-0 cursor-pointer select-none items-center justify-center rounded-full bg-emerald-50 text-emerald-600 transition-transform active:scale-95 dark:bg-emerald-900/30"
+                          >
+                            <MessagesSquare className="size-4" />
+                          </button>
+                          <button
+                            type="button"
+                            aria-label="Voice call"
+                            onClick={guard(() => verifyAndCall(c, "audio"))}
+                            className="flex size-9 shrink-0 cursor-pointer select-none items-center justify-center rounded-full bg-emerald-50 text-emerald-600 transition-transform active:scale-95 dark:bg-emerald-900/30"
+                          >
+                            <Phone className="size-4" />
+                          </button>
+                          <button
+                            type="button"
+                            aria-label="Video call"
+                            onClick={guard(() => verifyAndCall(c, "video"))}
+                            className="flex size-9 shrink-0 cursor-pointer select-none items-center justify-center rounded-full bg-emerald-50 text-emerald-600 transition-transform active:scale-95 dark:bg-emerald-900/30"
+                          >
+                            <Video className="size-4" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+
+                  {extraLookup.length > 0 ? (
+                    <div className="mt-3 space-y-2">
+                      <p className="px-1 text-xs text-muted-foreground">On Pro Chat India</p>
+                      {extraLookup.map((u) => (
+                        <div
+                          key={u.phone}
+                          className="flex items-center gap-3 rounded-2xl bg-white p-3 shadow-sm dark:bg-zinc-800"
+                        >
+                          <div className="flex size-11 shrink-0 items-center justify-center overflow-hidden rounded-full bg-secondary text-xl">
+                            <AvatarFace avatar={u.avatar} />
+                          </div>
+                          <div className="min-w-0 flex-1">
+                            <p className="truncate text-sm font-semibold">{u.name || u.phone}</p>
+                            <p className="truncate text-xs text-muted-foreground">{u.phone}</p>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setQuery("");
+                              setActiveChat({
+                                name: u.name || u.phone,
+                                avatar: u.avatar || "🙂",
+                                msg: "",
+                                phone: cleanNumber(u.phone),
+                              });
+                            }}
+                            className="shrink-0 rounded-xl bg-emerald-500 px-3 py-1.5 text-xs font-semibold text-white active:scale-95"
+                          >
+                            Chat Now
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+
+                  {recentChats.length > 0 ? (
+                    <div className="mt-3 space-y-2">
+                      {sortedPhoneContacts.length > 0 ? (
+                        <p className="px-1 text-xs text-muted-foreground">Groups & recent chats</p>
+                      ) : null}
+                      {recentChats.map((c) => (
+                        <div
+                          key={c.groupId ?? c.phone ?? c.name}
+                          role="button"
+                          tabIndex={0}
+                          onClick={() => {
+                            setQuery("");
+                            setActiveChat(rowToContact(c));
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              setQuery("");
+                              setActiveChat(rowToContact(c));
+                            }
+                          }}
+                          className="flex w-full cursor-pointer items-center gap-3 rounded-[28px] bg-white p-3 text-start shadow-sm transition-transform active:scale-[0.99] dark:bg-zinc-800"
+                        >
+                          <button
+                            type="button"
+                            aria-label={c.groupId ? "Open group" : "View profile"}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              if (c.groupId || !c.phone) {
+                                setQuery("");
+                                setActiveChat(rowToContact(c));
+                              } else {
+                                setProfileCard({ name: c.name, phone: c.phone, avatar: c.avatar });
+                              }
+                            }}
+                            className="shrink-0 transition-transform active:scale-95"
+                          >
+                            <StatusRing state={c.groupId ? "none" : ringOf(c.phone)}>
+                              <AvatarFace avatar={c.avatar} />
+                            </StatusRing>
+                          </button>
+                          <div className="min-w-0 flex-1">
+                            <p className="truncate text-sm font-semibold">{c.name}</p>
+                            <p className="truncate text-xs text-muted-foreground">{c.msg}</p>
+                          </div>
+                          <span className="flex h-6 shrink-0 items-center justify-center rounded-full bg-emerald-500 px-2.5 text-[10px] font-bold text-white">
+                            {compactTime(c.createdAt) || c.time}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+
+                  {nothingFound ? (
+                    <div className="space-y-3 py-8 text-center">
+                      <p className="text-sm text-muted-foreground">No matching contacts.</p>
+                      {queryDigits.length >= 10 ? (
+                        <button
+                          type="button"
+                          onClick={() => startNewChat(query)}
+                          className="rounded-2xl bg-emerald-500 px-5 py-2.5 text-sm font-semibold text-white active:scale-95"
+                        >
+                          Start chat with "{queryDigits.slice(-10)}"
+                        </button>
+                      ) : null}
+                    </div>
+                  ) : null}
+
+                  {!isSearching &&
+                  chip !== "All" &&
+                  sortedPhoneContacts.length === 0 &&
+                  recentChats.length === 0 ? (
+                    <p className="px-6 py-14 text-center text-sm text-muted-foreground">
+                      इस फ़िल्टर ({chip}) में कोई बातचीत नहीं है।
+                    </p>
+                  ) : null}
+
+                  {!isSearching &&
+                  chip === "All" &&
+                  contactsLoaded &&
+                  !chatsLoading &&
+                  !syncingContacts &&
+                  sortedPhoneContacts.length === 0 &&
+                  recentChats.length === 0 ? (
+                    <div className="flex flex-col items-center gap-3 px-6 py-16 text-center">
+                      <MessageCircleOff className="size-10 text-muted-foreground/60" />
+                      <p className="text-sm text-muted-foreground">
+                        No contacts yet. Sync your contacts or search a number to start chatting.
+                      </p>
+                      <button
+                        type="button"
+                        onClick={handleSyncContacts}
+                        className="rounded-2xl bg-emerald-500 px-5 py-2.5 text-sm font-semibold text-white active:scale-95"
+                      >
+                        Sync Contacts
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+
+              {tab === "groups" ? (
+                <div className="px-3 pb-28 pt-3 md:px-4 lg:pb-6">
+                  {/* Groups | Business पिल-टॉगल (Status | Business Showcase जैसा) */}
+                  <div className="mx-auto mb-3 flex w-full max-w-xs items-center rounded-full bg-secondary/40 p-1">
+                    <button
+                      type="button"
+                      onClick={() => setGroupSide("groups")}
+                      className={cn(
+                        "flex-1 rounded-full py-2 text-xs font-semibold transition-all",
+                        groupSide === "groups"
+                          ? "bg-gradient-to-r from-indigo-500 to-blue-600 text-white shadow-sm"
+                          : "text-muted-foreground",
+                      )}
+                    >
+                      Groups
+                    </button>
+                    <button
+                      type="button"
+                      onClick={selectBusinessSide}
+                      className={cn(
+                        "flex-1 rounded-full py-2 text-xs font-semibold transition-all",
+                        groupSide === "business"
+                          ? "bg-gradient-to-r from-purple-500 to-pink-500 text-white shadow-sm"
+                          : "text-muted-foreground",
+                      )}
+                    >
+                      Business
+                    </button>
+                  </div>
+
+                  {groupSide === "groups" ? (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => setGroupOpen(true)}
+                        className="mb-3 flex w-full items-center gap-3 rounded-full bg-white px-4 py-3 text-start shadow-sm dark:bg-zinc-800"
+                      >
+                        <span className="flex size-11 shrink-0 items-center justify-center rounded-full bg-brand-gradient text-white shadow-glow">
+                          <Users className="size-5" />
+                        </span>
+                        <span className="text-sm font-semibold">+ New Group</span>
+                      </button>
+
+                      {groupChats.length > 0 ? (
+                        <div className="space-y-2">
+                          {[...groupChats]
+                            .sort((a, b) => ts(b.createdAt) - ts(a.createdAt))
+                            .map((g) => (
+                              <button
+                                key={g.groupId ?? g.name}
+                                type="button"
+                                onClick={() => setActiveChat(rowToContact(g))}
+                                className="flex w-full items-center gap-3 rounded-[28px] bg-white p-3 text-start shadow-sm transition-transform active:scale-[0.99] dark:bg-zinc-800"
+                              >
+                                <StatusRing>
+                                  <AvatarFace avatar={g.avatar || "👥"} />
+                                </StatusRing>
+                                <div className="min-w-0 flex-1">
+                                  <p className="truncate text-sm font-semibold">{g.name}</p>
+                                  <p className="truncate text-xs text-muted-foreground">
+                                    {(g.memberPhones ?? []).length} members · {g.msg}
+                                  </p>
+                                </div>
+                                <span className="flex h-6 shrink-0 items-center justify-center rounded-full bg-emerald-500 px-2.5 text-[10px] font-bold text-white">
+                                  {compactTime(g.createdAt) || g.time}
+                                </span>
+                              </button>
+                            ))}
+                        </div>
+                      ) : (
+                        <div className="flex flex-col items-center gap-3 px-6 py-16 text-center">
+                          <Users className="size-10 text-muted-foreground/60" />
+                          <p className="text-sm text-muted-foreground">अभी आप किसी ग्रुप में नहीं हैं। नया ग्रुप बनाएँ।</p>
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      {/* Business: पतली पट्टी; पूरी सेटिंग "मेरा Business" बटन में */}
+                      <div className="mb-3 flex items-center gap-2 rounded-2xl bg-gradient-to-r from-purple-500 via-fuchsia-500 to-pink-500 px-3 py-2 text-white shadow-md">
+                        <BriefcaseBusiness className="size-5 shrink-0" />
+                        <p className="min-w-0 flex-1 truncate text-sm font-extrabold">Business Chats</p>
+                        <button
+                          type="button"
+                          onClick={() => setBizOpen(true)}
+                          className="flex h-9 shrink-0 items-center gap-1.5 rounded-full bg-white px-3 text-xs font-bold text-purple-600 active:scale-95"
+                        >
+                          <Settings2 className="size-4" /> मेरा Business
+                        </button>
+                      </div>
+                      {bizSetup?.offer?.on ? (
+                        <div className="mb-3">
+                          <OfferBannerCard offer={bizSetup.offer} name={bizSetup.name} />
+                        </div>
+                      ) : null}
+
+                      {businessChats.length > 0 ? (
+                        <div className="space-y-2">
+                          {businessChats.map((c) => (
+                            <button
+                              key={c.phone ?? c.name}
+                              type="button"
+                              onClick={() => setActiveChat(rowToContact(c))}
+                              className="flex w-full items-center gap-3 rounded-[28px] bg-white p-3 text-start shadow-sm transition-transform active:scale-[0.99] dark:bg-zinc-800"
+                            >
+                              <StatusRing state={ringOf(c.phone)}>
+                                <AvatarFace avatar={c.avatar} />
+                              </StatusRing>
+                              <div className="min-w-0 flex-1">
+                                <p className="flex items-center gap-1.5 truncate text-sm font-semibold">
+                                  <span className="truncate">{c.name}</span>
+                                  <span className="shrink-0 rounded-full bg-purple-100 px-1.5 py-0.5 text-[9px] font-bold text-purple-600 dark:bg-purple-500/20 dark:text-purple-300">
+                                    Business
+                                  </span>
+                                </p>
+                                <p className="truncate text-xs text-muted-foreground">{c.msg}</p>
+                              </div>
+                              <span className="flex h-6 shrink-0 items-center justify-center rounded-full bg-purple-500 px-2.5 text-[10px] font-bold text-white">
+                                {compactTime(c.createdAt) || c.time}
+                              </span>
+                            </button>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="flex flex-col items-center gap-3 px-6 py-12 text-center">
+                          <Store className="size-10 text-muted-foreground/60" />
+                          <p className="text-sm text-muted-foreground">
+                            अभी किसी दुकानदार से बातचीत नहीं है। Status › Business Showcase से किसी दुकान को चैट करें, या अपना Business बनाएँ।
+                          </p>
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+              ) : null}
+
+              {tab === "shopping" ? (
+                <ShoppingTab
+                  keypadStyle={state.theme.keypadStyle}
+                  onOpenBusiness={() => {
+                    setTab("groups");
+                    selectBusinessSide();
+                  }}
+                />
+              ) : null}
+
+              {tab === "status" ? (
+                <div className="space-y-4 pb-28 pt-4 lg:pb-6">
+                  <div className="mx-auto flex w-full max-w-xs items-center rounded-full bg-secondary/40 p-1">
+                    <button
+                      type="button"
+                      onClick={() => setStatusSubTab("status")}
+                      className={cn(
+                        "flex-1 rounded-full py-2 text-xs font-semibold transition-all",
+                        statusSubTab === "status" ? "bg-emerald-500 text-white shadow-sm" : "text-muted-foreground",
+                      )}
+                    >
+                      Status
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setStatusSubTab("reels")}
+                      className={cn(
+                        "flex-1 rounded-full py-2 text-xs font-semibold transition-all",
+                        statusSubTab === "reels"
+                          ? "bg-gradient-to-r from-purple-500 to-pink-500 text-white shadow-sm"
+                          : "text-muted-foreground",
+                      )}
+                    >
+                      Business Showcase
+                    </button>
+                  </div>
+
+    {statusSubTab === "status" ? (
+                    <StatusPanel
+                      myPhone={state.profile.phone}
+                      contacts={phoneContacts}
+                      defaultExpiry={state.storyExpiry ?? "24h"}
+                      keypadStyle={state.theme.keypadStyle}
+                      onChat={(phone) => openChatByPhone(phone)}
+                    />
+                  ) : null}
+                </div>
+              ) : null}
+
+              {tab === "calls" ? (
+                <CallsTab
+                  myPhone={state.profile.phone}
+                  contacts={phoneContacts}
+                  keypadStyle={state.theme.keypadStyle}
+                  onOpenChat={(phone) => openChatByPhone(phone)}
+                  onCall={(phone, kind, name) =>
+                    verifyAndCall(
+                      { name: name || phone, phone: cleanNumber(phone), avatar: "📞" },
+                      kind as CallKind,
+                    )
+                  }
+                />
+              ) : null}
+            </SafeBoundary>
+          </section>
+        </div>
+
+        {activeChat ? (
+          <div
+            style={appBgStyle}
+            className={cn(
+              "fixed inset-0 z-[9999] h-full w-full overflow-hidden lg:relative lg:z-auto lg:h-full lg:min-w-0 lg:flex-1",
+              !hasAppBg && "bg-background",
+            )}
+          >
+            <SafeBoundary key={activeChat.groupId ?? activeChat.phone ?? activeChat.name} label="चैट" onReset={() => setActiveChat(null)}>
+              {activeChat.groupId ? (
+                <GroupChatScreen
+                  group={{
+                    id: activeChat.groupId,
+                    name: activeChat.name,
+                    avatar: activeChat.avatar || "👥",
+                    memberPhones: activeChat.memberPhones ?? [],
+                  }}
+                  myPhone={state.profile.phone}
+                  nameOf={phoneName}
+                  onBack={() => setActiveChat(null)}
+                  keypadStyle={state.theme.keypadStyle}
+                />
+              ) : (
+                <ChatScreen
+                  contact={activeChat}
+                  onBack={() => setActiveChat(null)}
+                  keypadStyle={state.theme.keypadStyle}
+                  wallpaper={state.theme.chatWallpaper ?? state.theme.appWallpaper}
+                  t={t}
+                  myPhone={state.profile.phone}
+                  onContactUpdate={handleContactUpdate}
+                  onOpenSettings={() => {
+                    setActiveChat(null);
+                    setSettingsOpen(true);
+                  }}
+                  sendReadReceipts={readReceiptsOn}
+                  disappearAfterHours={disappearHours}
+                  spamScamProtection={Boolean(privacy.scamProtection)}
+                />
+              )}
+            </SafeBoundary>
+          </div>
+        ) : (
+          <div className="hidden flex-1 items-center justify-center lg:flex">
+            <div className="glass-card max-w-sm rounded-3xl p-8 text-center">
+              <AppIcon variant={state.theme.appIcon} className="mx-auto size-14 text-2xl" />
+              <p className="font-display mt-4 text-base font-semibold">Pro Chat India</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Select a conversation to start messaging securely.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {!activeChat ? (
+          <nav className="fixed bottom-3 inset-x-3 z-40 mx-auto w-auto max-w-sm lg:hidden">
+            <div className="flex items-end justify-around rounded-[28px] border border-black/5 bg-white/90 px-1.5 pb-2 pt-2 shadow-2xl backdrop-blur-xl dark:border-white/10 dark:bg-zinc-900/90">
+              {BOTTOM_NAV.map((item) => (
+                <button
+                  key={item.key}
+                  type="button"
+                  onClick={item.onClick}
+                  aria-label={item.label}
+                  aria-current={item.active ? "page" : undefined}
+                  className="relative flex flex-1 flex-col items-center gap-0.5 px-1 transition-transform duration-300 ease-[cubic-bezier(0.34,1.56,0.64,1)] active:scale-90"
+                >
+                  <span
+                    className={cn(
+                      "flex size-12 items-center justify-center rounded-2xl transition-all duration-300 ease-[cubic-bezier(0.34,1.56,0.64,1)]",
+                      item.active ? `${item.tint} -translate-y-1.5 scale-110 shadow-md` : "bg-transparent",
+                    )}
+                  >
+                    <item.Icon className={cn("size-8 transition-all", item.active ? "" : "opacity-90")} />
+                  </span>
+                  <span
+                    className={cn(
+                      "text-[10px] leading-none",
+                      item.active ? `font-extrabold ${item.labelCls}` : "font-medium text-zinc-500 dark:text-zinc-400",
+                    )}
+                  >
+                    {item.label}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </nav>
+        ) : null}
+      </div>
+
+      <SettingsSheet open={settingsOpen} onClose={() => setSettingsOpen(false)}>
+        <SafeBoundary label="सेटिंग्स" onReset={() => setSettingsOpen(false)}>
+          <SettingsTab state={state} update={update} t={t} profileSignal={profileSignal} />
+        </SafeBoundary>
+      </SettingsSheet>
+
+      {/* मेरा Business: बैनर/सेटिंग्स का अपना बैंगनी-गुलाबी रूप */}
+      <SettingsSheet
+        open={bizOpen}
+        onClose={() => setBizOpen(false)}
+        title="My Business"
+        headerClass="bg-gradient-to-r from-purple-500 to-pink-500"
+        compact
+      >
+        <SafeBoundary label="बिज़नेस" onReset={() => setBizOpen(false)}>
+          <BusinessPanel
+            phone={myClean}
+            setup={bizSetup}
+            keypadStyle={state.theme.keypadStyle}
+            onChange={setBizSetup}
+            onEdit={() => setBizSetupOpen(true)}
+          />
+          <BusinessTab
+            state={state}
+            update={update}
+            onOpenChat={(phone, name) => {
+              setBizOpen(false);
+              setActiveChat({ name, avatar: "🙂", msg: "", phone });
+            }}
+          />
+        </SafeBoundary>
+      </SettingsSheet>
+
+      {tab === "status" && statusSubTab === "reels" ? (
+        <SafeBoundary label="रील्स" onReset={() => setStatusSubTab("status")}>
+          <ReelsFeed
+            myPhone={state.profile.phone}
+            onClose={() => setStatusSubTab("status")}
+            onReply={(phone, item) => {
+              setStatusSubTab("status");
+              setTab("chats");
+              openChatByPhone(phone, item.owner_name);
+            }}
+          />
+        </SafeBoundary>
+      ) : null}
+
+      {liveCall ? (
+        <div className="fixed inset-0 z-[70]">
+          <CallScreen
+            name={liveCall.name}
+            avatar={liveCall.avatar}
+            kind={liveCall.kind}
+            myPhone={myClean}
+            peerPhones={[liveCall.phone]}
+            nameOf={phoneName}
+            onEnd={() => setLiveCall(null)}
+            ringingLabel={t("ringing")}
+            endLabel={t("endCall")}
+          />
+        </div>
+      ) : null}
+
+      {chatTimerPromptOpen ? (
+        <div className="fixed inset-0 z-[65] flex items-end justify-center bg-black/50 p-4 backdrop-blur-sm sm:items-center">
+          <div className="glass-card animate-pop relative w-full max-w-xs rounded-3xl p-5 shadow-elevated">
+            <button
+              type="button"
+              aria-label="Close"
+              onClick={() => {
+                // सिर्फ़ बंद करो; टाइमर अपने-आप चालू नहीं होना चाहिए (वरना मैसेज चुपचाप डिलीट होने लगेंगे)
+                update({ disappearingPromptSeen: true });
+                setChatTimerPromptOpen(false);
+              }}
+              className="absolute right-3 top-3 rounded-full p-1 text-muted-foreground transition-colors hover:text-foreground"
+            >
+              <X className="size-4" />
+            </button>
+            <p className="font-display pr-6 text-sm font-semibold">Set Message Timer</p>
+            <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+              Choose auto-delete duration for messages to save privacy and storage.
+            </p>
+            <button
+              type="button"
+              onClick={() => {
+                update({ disappearingPromptSeen: true });
+                setChatTimerPromptOpen(false);
+                openTab("settings");
+              }}
+              className="bg-brand-gradient mt-4 w-full rounded-2xl py-2.5 text-sm font-semibold text-primary-foreground shadow-glow transition-all active:scale-95"
+            >
+              Set Duration
+            </button>
+          </div>
+        </div>
+      ) : null}
+
+      {unregisteredCallPrompt ? (
+        <div
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-6"
+          onClick={() => setUnregisteredCallPrompt(null)}
+        >
+          <div
+            className="w-full max-w-sm rounded-2xl bg-white p-5 text-center text-zinc-900 dark:bg-zinc-900 dark:text-white"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <p className="mb-2 text-3xl">📵</p>
+            <p className="font-semibold">
+              {unregisteredCallPrompt.name} अभी ProChat India पर नहीं है।
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              क्या आप सामान्य फ़ोन कॉल करना चाहते हैं या इनवाइट लिंक भेजना चाहते हैं?
+            </p>
+            <div className="mt-4 flex gap-2">
+              <a
+                href={`tel:+91${unregisteredCallPrompt.phone}`}
+                className="flex-1 rounded-xl bg-emerald-500 px-3 py-2 text-sm font-semibold text-white"
+              >
+                Normal Call
+              </a>
+              <button
+                onClick={async () => {
+                  const text = `Pro Chat India पर मुझसे जुड़ें! यहाँ से डाउनलोड करें: https://digital-hindu-connect.vercel.app/get`;
+                  try {
+                    if (navigator.share) await navigator.share({ text });
+                    else if (navigator.clipboard) await navigator.clipboard.writeText(text);
+                  } catch {
+                    /* cancelled */
+                  }
+                  setUnregisteredCallPrompt(null);
+                }}
+                className="flex-1 rounded-xl bg-secondary px-3 py-2 text-sm font-semibold"
+              >
+                Send Invite
+              </button>
+            </div>
+            <button
+              onClick={() => setUnregisteredCallPrompt(null)}
+              className="mt-3 text-xs text-muted-foreground"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      ) : null}
+
+      {showInvite ? (
+        <div
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-6"
+          onClick={() => setShowInvite(false)}
+        >
+          <div
+            className="w-full max-w-sm rounded-2xl bg-white p-5 text-center text-zinc-900 dark:bg-zinc-900 dark:text-white"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <p className="mb-2 text-3xl">📵</p>
+            <p className="font-semibold">
+              This contact is not on Pro Chat India. Invite them to download the APK!
+            </p>
+            <button
+              onClick={() => setShowInvite(false)}
+              className="mt-4 rounded-xl bg-emerald-500 px-5 py-2 text-white"
+            >
+              OK
+            </button>
+          </div>
+        </div>
+      ) : null}
+
+      {profileCard ? (
+        <ContactCardModal
+          card={profileCard}
+          ring={ringOf(profileCard.phone)}
+          onClose={() => setProfileCard(null)}
+          onMessage={() => {
+            const c = profileCard;
+            setProfileCard(null);
+            openChatByPhone(c.phone, c.name);
+          }}
+          onCall={(kind) => {
+            const c = profileCard;
+            setProfileCard(null);
+            guard(() => verifyAndCall({ name: c.name, phone: c.phone, avatar: c.avatar }, kind))();
+          }}
+          onViewStatus={() => {
+            const c = profileCard;
+            markSeen(c.phone, statusMap.get(cleanNumber(c.phone)));
+            setProfileCard(null);
+            openTab("status");
+          }}
+        />
+      ) : null}
+
+      <BusinessSetupSheet
+        open={bizSetupOpen}
+        phone={myClean}
+        initial={bizSetup}
+        firstTime={!bizSetup}
+        keypadStyle={state.theme.keypadStyle}
+        onClose={() => setBizSetupOpen(false)}
+        onSaved={(d) => {
+          const first = !bizSetup;
+          setBizSetup(d);
+          setBizSetupOpen(false);
+          if (first) setGroupSide("business");
+        }}
+      />
+
+      <NewGroupDialog
+        open={groupOpen}
+        onOpenChange={setGroupOpen}
+        contacts={phoneContacts.map((c) => ({ name: c.name, avatar: c.avatar, phone: c.phone }))}
+        t={t}
+        onCreate={(name, members) => void createGroup(name, members)}
+      />
+
+      {/* आने वाली कॉल: फ़ुल-स्क्रीन Accept / Decline */}
+      <IncomingCallHost myPhone={state.profile.phone} nameOf={phoneName} />
+      {/* दूसरे ऐप (YouTube/Chrome) से Share होकर आया लिंक: किसी चैट में भेजो */}
+      <ShareTargetHost myPhone={state.profile.phone} />
+      {modal}
+      <BatteryGuide open={showBat} onClose={() => setShowBat(false)} />
+    </main>
+  );
+}
